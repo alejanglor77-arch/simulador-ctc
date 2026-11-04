@@ -2,21 +2,33 @@
 
 Simulador en tiempo real de un Puesto de Mando ferroviario (CTC) en el que cada tren, cantón y aguja es un **agente autónomo** que se comunica con un **orquestador central**. Tiene botón de **Play**, animación del tráfico e **inyección de fallos** en cualquier momento.
 
-## Puesta en marcha
+## Publicarlo en internet (GitHub + Streamlit Community Cloud)
+
+No hace falta instalar nada en tu ordenador.
+
+1. **Crear el repositorio**: en github.com pulsa **New repository**, ponle un nombre (por ejemplo `simulador-ctc`), márcalo como **Public** y pulsa **Create repository**.
+2. **Subir los archivos**: en el repositorio vacío pulsa **uploading an existing file** y arrastra `app.py`, `sim.py`, `requirements.txt` y `README.md`. Pulsa **Commit changes**.
+3. **Añadir el tema oscuro** (opcional): **Add file → Create new file**, escribe como nombre `.streamlit/config.toml` (la barra crea la carpeta), pega el contenido de ese archivo y pulsa **Commit changes**.
+4. **Desplegar**: entra en share.streamlit.io con tu cuenta de GitHub, pulsa **Create app → Deploy a public app from GitHub**, elige el repositorio, la rama `main` y el archivo `app.py`, y pulsa **Deploy**. En 2-3 minutos tendrás una dirección web propia.
+5. **Actualizar**: cualquier cambio que guardes en GitHub se refleja automáticamente en la app.
+
+Los cuatro archivos tienen que estar en la raíz del repositorio, uno al lado del otro: `app.py` importa `sim.py` y Streamlit busca `requirements.txt` junto al archivo principal.
+
+## Ejecutarlo en tu propio ordenador (opcional)
+
+Solo si quieres probarlo sin internet, con Python instalado:
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Para publicarlo: sube la carpeta a un repositorio de GitHub y despliégalo en Streamlit Community Cloud indicando `app.py` como archivo principal.
-
 ## Estructura
 
 | Archivo | Qué contiene |
 |---|---|
 | `sim.py` | Motor de simulación y agentes. Python puro, sin dependencias: se puede probar o reutilizar sin interfaz. |
-| `app.py` | Interfaz Streamlit + Plotly: esquema de vías animado, KPIs, telemetría, bus de mensajes y panel de fallos. |
+| `app.py` | Interfaz Streamlit: esquema de vías animado, KPIs, telemetría, bus de mensajes y panel de fallos. |
 | `.streamlit/config.toml` | Tema oscuro tipo pantalla de CTC. |
 
 ## Agentes

@@ -1,17 +1,27 @@
 """
-Simulador CTC multiagente · interfaz Streamlit + Plotly
+Simulador CTC multiagente · interfaz Streamlit
 Ejecutar:  streamlit run app.py
 """
 import time
 
 import pandas as pd
-import plotly.graph_objects as go
+from html import escape
 import streamlit as st
 
 from sim import (ESCAPES, KMH, LONG_CANTON, LONG_LINEA, N_CANTONES, TIPOS_FALLO,
                  Simulacion, otra, reloj, s_a_x)
 
 st.set_page_config(page_title="CTC Multiagente", page_icon="🚆", layout="wide")
+
+# Sin parpadeo: Streamlit atenúa los elementos mientras refresca; aquí se desactiva ese efecto.
+st.markdown("""
+<style>
+[data-stale="true"], .stale-element, [data-testid="stElementContainer"][data-stale="true"] {
+    opacity: 1 !important; transition: none !important; filter: none !important;
+}
+[data-testid="stStatusWidget"] { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
 # --------------------------------------------------------------------------- #
 # Estado de la sesión
@@ -58,7 +68,9 @@ with st.sidebar:
     tipo = st.selectbox("Tipo de fallo", list(TIPOS_FALLO), format_func=TIPOS_FALLO.get)
     objetivo = st.selectbox("Elemento afectado", ["Aleatorio"] + sim.objetivos(tipo))
     if st.button("Inyectar fallo ahora", type="primary", width="stretch"):
-        st.toast(sim.inyectar_fallo(tipo, None if objetivo == "Aleatorio" else objetivo), icon="⚡")
+        texto = sim.inyectar_fallo(tipo, None if objetivo == "Aleatorio" else objetivo)
+        sim.ultimo_fallo = (sim.t, "manual", texto)
+        st.toast(texto, icon="⚡")
 
     sim.fallos_aleatorios = st.toggle("Fallos aleatorios automáticos", value=sim.fallos_aleatorios)
     if sim.fallos_aleatorios:
@@ -66,6 +78,14 @@ with st.sidebar:
     if st.button("🔧 Enviar brigada de mantenimiento", width="stretch"):
         sim.resolver_todo()
         st.toast("Incidencias resueltas", icon="🔧")
+
+    st.divider()
+    st.subheader("🔀 Maniobra de agujas")
+    st.caption("Pide al CTC que pase un tren a la vía contraria entre los dos próximos escapes "
+               "y lo devuelva a su vía. Solo lo hará cuando sea seguro.")
+    tren_maniobra = st.selectbox("Tren", [t.id for t in sim.trenes])
+    if st.button("Ordenar cambio de vía", width="stretch"):
+        st.toast(sim.ordenar_cambio_via(tren_maniobra), icon="🔀")
 
     st.divider()
     st.checkbox("Mostrar telemetría periódica en el bus", value=False, key="ver_telemetria")
@@ -85,12 +105,45 @@ def y_tren(tr, s):
     return yh + (ya - yh) * (rampa(c1) - rampa(c2))
 
 
-def esquema(sim: Simulacion) -> go.Figure:
-    fig = go.Figure()
-    ocup = sim._mapa_ocupacion()
+# Dibujo en SVG: el navegador sustituye la imagen de golpe en cada refresco, sin parpadeo.
+ANCHO, ALTO = 1400, 360
+X0, X1 = 95, 1375                    # píxeles del PK 0 y del PK 24
+YV = {1: 125.0, 2: 255.0}            # píxeles de cada vía
 
-    # Cantones agrupados por color
-    grupos: dict = {}
+
+def px(km: float) -> float:
+    return X0 + (X1 - X0) * km / (LONG_LINEA / 1000)
+
+
+def py(y_logico: float) -> float:    # 1 = vía 1, 0 = vía 2
+    return YV[2] + (YV[1] - YV[2]) * y_logico
+
+
+def esquema(sim: Simulacion) -> str:
+    ocup = sim._mapa_ocupacion()
+    e = []
+    e.append(f'<rect x="0" y="0" width="{ANCHO}" height="{ALTO}" rx="10" fill="#0b1220"/>')
+
+    # Escapes (debajo de las vías)
+    for ag in sim.agujas:
+        xk = ag.x / 1000
+        if ag.averiada:
+            color, ancho, trazo = "#ef4444", 3, ' stroke-dasharray="7 5"'
+        elif ag.asignada_a:
+            color, ancho, trazo = "#22c55e", 4, ""
+        else:
+            color, ancho, trazo = "#334155", 2, ""
+        tip = f"{ag.nombre} · {ag.posicion} · motor {ag.temperatura_motor:.0f} °C" + (" · AVERIADA" if ag.averiada else "")
+        e.append(f'<g><title>{escape(tip)}</title>'
+                 f'<line x1="{px(xk - 0.35):.1f}" y1="{YV[1]}" x2="{px(xk + 0.35):.1f}" y2="{YV[2]}" '
+                 f'stroke="{color}" stroke-width="{ancho}"{trazo}/>'
+                 f'<line x1="{px(xk - 0.35):.1f}" y1="{YV[2]}" x2="{px(xk + 0.35):.1f}" y2="{YV[1]}" '
+                 f'stroke="{color}" stroke-width="{ancho}"{trazo}/>'
+                 f'<rect x="{px(xk) - 15:.1f}" y="{(YV[1] + YV[2]) / 2 - 10}" width="30" height="20" rx="4" fill="#0b1220"/>'
+                 f'<text x="{px(xk):.1f}" y="{(YV[1] + YV[2]) / 2 + 4}" text-anchor="middle" font-size="12" '
+                 f'font-weight="700" fill="{color if ag.averiada or ag.asignada_a else "#94a3b8"}">{ag.nombre}</text></g>')
+
+    # Cantones
     for (via, idx), c in sim.cantones.items():
         if c.obstaculo_x is not None:
             estado = "obstaculo"
@@ -102,50 +155,26 @@ def esquema(sim: Simulacion) -> go.Figure:
             estado = "reservado"
         else:
             estado = "libre"
-        xs, ys = grupos.setdefault(estado, ([], []))
-        x0, x1 = idx * LONG_CANTON / 1000 + 0.05, (idx + 1) * LONG_CANTON / 1000 - 0.05
-        xs += [x0, x1, None]
-        ys += [Y[via], Y[via], None]
-    for estado, (xs, ys) in grupos.items():
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", hoverinfo="skip", showlegend=False,
-                                 line=dict(color=COLOR_CANTON[estado], width=7)))
-
-    # LTV
-    for c in sim.cantones.values():
+        x0, x1 = px(idx * 2 + 0.05), px(idx * 2 + 1.95)
+        tip = f"{c.id} · carril {c.temperatura:.0f} °C · vibración {c.vibracion:.2f}"
+        e.append(f'<line x1="{x0:.1f}" y1="{YV[via]}" x2="{x1:.1f}" y2="{YV[via]}" stroke="{COLOR_CANTON[estado]}" '
+                 f'stroke-width="7" stroke-linecap="round"><title>{escape(tip)}</title></line>')
         if c.ltv is not None:
-            dy = 0.11 if c.via == 1 else -0.11
-            x0, x1 = c.idx * 2 + 0.1, c.idx * 2 + 1.9
-            fig.add_trace(go.Scatter(x=[x0, x1], y=[Y[c.via] + dy] * 2, mode="lines", showlegend=False,
-                                     hovertext=f"LTV {c.ltv / KMH:.0f} km/h · {c.ltv_motivo}", hoverinfo="text",
-                                     line=dict(color="#eab308", width=2, dash="dot")))
-            fig.add_annotation(x=(x0 + x1) / 2, y=Y[c.via] + dy * 3.2, text=f"LTV {c.ltv / KMH:.0f}",
-                               showarrow=False, font=dict(color="#eab308", size=10))
-
-    # Escapes (agujas)
-    for ag in sim.agujas:
-        xk = ag.x / 1000
-        if ag.averiada:
-            color, ancho, trazo = "#ef4444", 3, "dash"
-        elif ag.asignada_a:
-            color, ancho, trazo = "#22c55e", 4, "solid"
-        else:
-            color, ancho, trazo = "#334155", 2, "solid"
-        for ya, yb in ((1, 0), (0, 1)):
-            fig.add_trace(go.Scatter(x=[xk - 0.35, xk + 0.35], y=[ya, yb], mode="lines", showlegend=False,
-                                     hovertext=f"{ag.nombre} · {ag.posicion} · motor {ag.temperatura_motor:.0f} °C"
-                                               + (" · AVERIADA" if ag.averiada else ""),
-                                     hoverinfo="text", line=dict(color=color, width=ancho, dash=trazo)))
-        fig.add_annotation(x=xk, y=0.5, text=f"<b>{ag.nombre}</b>", showarrow=False,
-                           font=dict(size=10, color=color if ag.averiada or ag.asignada_a else "#94a3b8"),
-                           bgcolor="#0b1220")
+            dy = -16 if via == 1 else 16
+            e.append(f'<line x1="{x0 + 6:.1f}" y1="{YV[via] + dy}" x2="{x1 - 6:.1f}" y2="{YV[via] + dy}" '
+                     f'stroke="#eab308" stroke-width="2" stroke-dasharray="3 4"/>'
+                     f'<text x="{(x0 + x1) / 2:.1f}" y="{YV[via] + dy * 2.6 + 4:.1f}" text-anchor="middle" '
+                     f'font-size="11" fill="#eab308">LTV {c.ltv / KMH:.0f} · {escape(c.ltv_motivo)}</text>')
 
     # Obstáculos
     for c in sim.cantones.values():
         if c.obstaculo_x is not None:
-            fig.add_trace(go.Scatter(x=[c.obstaculo_x / 1000], y=[Y[c.via]], mode="markers+text",
-                                     marker=dict(symbol="x", size=16, color="#d946ef", line=dict(width=2)),
-                                     text=["obstáculo"], textposition="bottom center" if c.via == 2 else "top center",
-                                     textfont=dict(color="#d946ef", size=10), showlegend=False, hoverinfo="skip"))
+            xo, yo = px(c.obstaculo_x / 1000), YV[c.via]
+            e.append(f'<g stroke="#d946ef" stroke-width="4" stroke-linecap="round">'
+                     f'<line x1="{xo - 9:.1f}" y1="{yo - 9}" x2="{xo + 9:.1f}" y2="{yo + 9}"/>'
+                     f'<line x1="{xo - 9:.1f}" y1="{yo + 9}" x2="{xo + 9:.1f}" y2="{yo - 9}"/></g>'
+                     f'<text x="{xo:.1f}" y="{yo + (-18 if c.via == 1 else 28)}" text-anchor="middle" '
+                     f'font-size="11" fill="#d946ef">obstáculo</text>')
 
     # Trenes
     for tr in sim.trenes:
@@ -154,50 +183,60 @@ def esquema(sim: Simulacion) -> go.Figure:
         color = COLOR_ESTADO.get(tr.estado, "#e2e8f0")
         pasos = max(2, int(tr.longitud // 40))
         ss = [tr.s - tr.longitud + k * tr.longitud / pasos for k in range(pasos + 1)]
-        xs = [s_a_x(s, tr.sentido) / 1000 for s in ss]
-        ys = [y_tren(tr, s) for s in ss]
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=color, width=11),
-                                 showlegend=False, hoverinfo="skip"))
-        arriba = tr.via_base == 1
-        hover = (f"<b>{tr.id}</b> · {tr.tipo}<br>{tr.v / KMH:.0f} km/h (permitida {tr.v_permitida / KMH:.0f})"
-                 f"<br>Estado: {tr.estado}<br>Autorización: {max(0, tr.ma_s - tr.s):.0f} m<br>{tr.motivo}")
-        fig.add_trace(go.Scatter(
-            x=[xs[-1]], y=[ys[-1]], mode="markers+text",
-            marker=dict(symbol="triangle-right" if tr.sentido > 0 else "triangle-left", size=17, color=color,
-                        line=dict(color="#38bdf8" if tr.plan else "#0b1220", width=3 if tr.plan else 1)),
-            text=[f"<b>{tr.id}</b> {tr.v / KMH:.0f}"], textposition="top center" if arriba else "bottom center",
-            textfont=dict(color="#e2e8f0", size=11), hovertext=hover, hoverinfo="text", showlegend=False))
+        puntos = [(px(s_a_x(sv, tr.sentido) / 1000), py(y_tren(tr, sv))) for sv in ss]
+        hx, hy = puntos[-1]
+        d = 13 if tr.sentido > 0 else -13
+        tri = f"{hx + d:.1f},{hy:.1f} {hx - d * 0.3:.1f},{hy - 9:.1f} {hx - d * 0.3:.1f},{hy + 9:.1f}"
+        borde = 'stroke="#38bdf8" stroke-width="3"' if tr.plan else 'stroke="#0b1220" stroke-width="1"'
+        tip = (f"{tr.id} · {tr.tipo}\n{tr.v / KMH:.0f} km/h (permitida {tr.v_permitida / KMH:.0f})\n"
+               f"Estado: {tr.estado}\nAutorización: {max(0, tr.ma_s - tr.s):.0f} m\n{tr.motivo}")
+        ty = hy - 22 if tr.via_base == 1 else hy + 32
+        e.append(f'<g><title>{escape(tip)}</title>'
+                 f'<polyline points="{" ".join(f"{a:.1f},{b:.1f}" for a, b in puntos)}" fill="none" '
+                 f'stroke="{color}" stroke-width="11" stroke-linecap="round"/>'
+                 f'<polygon points="{tri}" fill="{color}" {borde}/>'
+                 f'<text x="{hx:.1f}" y="{ty:.1f}" text-anchor="middle" font-size="13" fill="#e2e8f0">'
+                 f'<tspan font-weight="700">{tr.id}</tspan> {tr.v / KMH:.0f} km/h</text></g>')
 
-    fig.add_annotation(x=-0.3, y=1, text="Vía 1 ▶", showarrow=False, xanchor="right", font=dict(color="#94a3b8"))
-    fig.add_annotation(x=-0.3, y=0, text="◀ Vía 2", showarrow=False, xanchor="right", font=dict(color="#94a3b8"))
+    # Rótulos y eje
+    e.append(f'<text x="{X0 - 18}" y="{YV[1] + 5}" text-anchor="end" font-size="14" fill="#94a3b8">Vía 1 ▶</text>')
+    e.append(f'<text x="{X0 - 18}" y="{YV[2] + 5}" text-anchor="end" font-size="14" fill="#94a3b8">◀ Vía 2</text>')
     for i in range(N_CANTONES):
-        fig.add_annotation(x=i * 2 + 1, y=-0.47, text=f"{i + 1:02d}", showarrow=False,
-                           font=dict(size=9, color="#64748b"))
-
-    fig.update_layout(
-        height=380, margin=dict(l=70, r=20, t=10, b=30), paper_bgcolor="#0b1220", plot_bgcolor="#0b1220",
-        xaxis=dict(range=[-2.2, LONG_LINEA / 1000 + 0.4], title="PK (km)", color="#94a3b8", showgrid=False,
-                   zeroline=False, tickvals=list(range(0, 25, 2))),
-        yaxis=dict(range=[-0.6, 1.6], visible=False, fixedrange=True),
-        uirevision="ctc", hoverlabel=dict(bgcolor="#1e293b"),
-    )
-    return fig
+        e.append(f'<text x="{px(i * 2 + 1):.1f}" y="300" text-anchor="middle" font-size="11" fill="#475569">'
+                 f'{i + 1:02d}</text>')
+    for km in range(0, 25, 2):
+        e.append(f'<text x="{px(km):.1f}" y="328" text-anchor="middle" font-size="12" fill="#94a3b8">{km}</text>')
+    e.append(f'<text x="{(X0 + X1) / 2}" y="350" text-anchor="middle" font-size="12" fill="#64748b">'
+             f'PK (km) · los números pequeños son los cantones · pasa el ratón por encima para ver detalles</text>')
+    return (f'<svg viewBox="0 0 {ANCHO} {ALTO}" width="100%" xmlns="http://www.w3.org/2000/svg" '
+            f'font-family="system-ui, -apple-system, sans-serif">{"".join(e)}</svg>')
 
 
-def grafico_velocidades(sim: Simulacion) -> go.Figure:
+def grafico_velocidades(sim: Simulacion) -> str:
     trenes = [t for t in sim.trenes if t.en_linea]
-    ids = [t.id for t in trenes]
-    fig = go.Figure([
-        go.Bar(name="Velocidad real", x=ids, y=[t.v / KMH for t in trenes],
-               marker_color=[COLOR_ESTADO.get(t.estado, "#94a3b8") for t in trenes]),
-        go.Scatter(name="Curva de frenado (v. permitida)", x=ids, y=[t.v_permitida / KMH for t in trenes],
-                   mode="markers", marker=dict(symbol="line-ew", size=34, color="#e2e8f0",
-                                               line=dict(width=3, color="#e2e8f0"))),
-    ])
-    fig.update_layout(height=260, margin=dict(l=40, r=10, t=10, b=30), paper_bgcolor="rgba(0,0,0,0)",
-                      plot_bgcolor="rgba(0,0,0,0)", yaxis=dict(title="km/h", range=[0, 240], gridcolor="#1e293b"),
-                      legend=dict(orientation="h", y=1.15), uirevision="vel")
-    return fig
+    W, H, izq, abajo, arriba = 640, 250, 46, 215, 20
+    vmax = 240.0
+    yv = lambda v: abajo - (abajo - arriba) * min(v, vmax) / vmax
+    e = [f'<rect x="0" y="0" width="{W}" height="{H}" rx="10" fill="#0b1220"/>']
+    for v in range(0, 241, 60):
+        e.append(f'<line x1="{izq}" y1="{yv(v):.1f}" x2="{W - 10}" y2="{yv(v):.1f}" stroke="#1e293b"/>'
+                 f'<text x="{izq - 6}" y="{yv(v) + 4:.1f}" text-anchor="end" font-size="11" fill="#64748b">{v}</text>')
+    if trenes:
+        hueco = (W - izq - 10) / len(trenes)
+        for i, t in enumerate(trenes):
+            cx = izq + hueco * (i + 0.5)
+            v, vp = t.v / KMH, t.v_permitida / KMH
+            color = COLOR_ESTADO.get(t.estado, "#94a3b8")
+            e.append(f'<g><title>{escape(t.id)}: {v:.0f} km/h · permitida {vp:.0f} km/h · {escape(t.estado)}</title>'
+                     f'<rect x="{cx - 22:.1f}" y="{yv(v):.1f}" width="44" height="{abajo - yv(v):.1f}" rx="3" fill="{color}"/>'
+                     f'<line x1="{cx - 32:.1f}" y1="{yv(vp):.1f}" x2="{cx + 32:.1f}" y2="{yv(vp):.1f}" '
+                     f'stroke="#e2e8f0" stroke-width="3"/>'
+                     f'<text x="{cx:.1f}" y="{abajo + 18}" text-anchor="middle" font-size="12" fill="#cbd5e1">'
+                     f'{escape(t.id)}</text></g>')
+    e.append(f'<text x="{izq}" y="14" font-size="11" fill="#94a3b8">km/h · barra = velocidad real · '
+             f'raya blanca = velocidad permitida por la curva de frenado</text>')
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" xmlns="http://www.w3.org/2000/svg" '
+            f'font-family="system-ui, -apple-system, sans-serif">{"".join(e)}</svg>')
 
 
 # --------------------------------------------------------------------------- #
@@ -231,15 +270,17 @@ def panel():
     cols[6].metric("Incidentes", k["incidentes"], help="Impactos o solapamientos (debería ser 0 salvo "
                    "obstáculos que aparecen dentro de la distancia de frenado).")
 
-    st.plotly_chart(esquema(sim), width="stretch", config={"displayModeBar": False}, key="mapa")
+    if sim.ultimo_fallo:
+        t_f, origen, texto = sim.ultimo_fallo
+        st.info(f"⚡ Último fallo ({origen}, {reloj(t_f)}): {texto}")
+    st.markdown(esquema(sim), unsafe_allow_html=True)
 
     izq, der = st.columns([1.15, 1])
     with izq:
         st.markdown("**📡 Telemetría de los agentes tren**")
         st.dataframe(pd.DataFrame(sim.tabla_trenes()), hide_index=True, width="stretch", height=250)
         st.markdown("**🛑 Supervisión de la curva de frenado**")
-        st.plotly_chart(grafico_velocidades(sim), width="stretch",
-                        config={"displayModeBar": False}, key="vel")
+        st.markdown(grafico_velocidades(sim), unsafe_allow_html=True)
     with der:
         st.markdown("**🧠 Bus de mensajes entre agentes**")
         ver_tel = st.session_state.get("ver_telemetria", False)

@@ -200,6 +200,7 @@ class AgenteTren:
     prox_intento_ruta: float = 0.0
     ultimo_rechazo: Optional[str] = None
     estado_registrado: str = ""
+    orden_cambio: bool = False
 
     @property
     def sentido(self) -> int:
@@ -251,7 +252,8 @@ class Simulacion:
         self.reservas: dict = {}
         self.trenes = self._crear_flota()
         self.fallos_aleatorios = False
-        self.tasa_fallos_hora = 6.0
+        self.tasa_fallos_hora = 20.0
+        self.ultimo_fallo: Optional[tuple] = None
         self.rutas_banalizadas = 0
         self.incidentes = 0
         self.fallos_inyectados = 0
@@ -323,7 +325,8 @@ class Simulacion:
 
         # 4) Fallos aleatorios y telemetría consolidada
         if self.fallos_aleatorios and self.rng.random() < self.tasa_fallos_hora / 3600.0 * dt:
-            self.inyectar_fallo(self.rng.choice(list(TIPOS_FALLO)), None)
+            texto = self.inyectar_fallo(self.rng.choice(list(TIPOS_FALLO)), None)
+            self.ultimo_fallo = (self.t, "automático", texto)
         if self.t >= self._prox_telemetria:
             self._prox_telemetria += 60.0
             k = self.kpis()
@@ -478,6 +481,8 @@ class Simulacion:
 
             if bloqueo:
                 self._gestionar_bloqueo(tr, bloqueo, dt, ocup)
+            elif tr.orden_cambio and tr.plan is None and t >= tr.prox_intento_ruta:
+                self._intentar_orden_cambio(tr)
 
         v_nueva = max(0.0, tr.v + a * dt)
         tr.s += (tr.v + v_nueva) / 2 * dt
@@ -499,6 +504,7 @@ class Simulacion:
             if tr.plan:
                 self._liberar_ruta(tr, "Salida del tramo")
             tr.en_linea = False
+            tr.orden_cambio = False
             tr.espera_entrada = 25.0 + self.rng.uniform(0, 30)
             self.bus.enviar(t, tr.id, "CTC", "SALIDA", "Sale del tramo controlado.", "info")
 
@@ -575,13 +581,20 @@ class Simulacion:
         if not posteriores:
             return rechazar("sin escape de retorno tras el bloqueo")
         c2 = min(posteriores)
+        razon = self._establecer_ruta(tr, c1, c2, ocup)
+        return True if razon is None else rechazar(razon)
 
+    def _establecer_ruta(self, tr: AgenteTren, c1: float, c2: float, ocup: dict) -> Optional[str]:
+        """Comprueba y, si es segura, establece la ruta por la vía contraria entre los escapes
+        c1 y c2. Devuelve None si la ruta queda establecida o el motivo del rechazo."""
+        sentido = tr.sentido
+        via_alt = otra(tr.via_base)
         ag1, ag2 = self._aguja_cerca(s_a_x(c1, sentido)), self._aguja_cerca(s_a_x(c2, sentido))
         for ag in (ag1, ag2):
             if ag is None or ag.averiada:
-                return rechazar(f"aguja {ag.nombre if ag else '?'} averiada")
+                return f"aguja {ag.nombre if ag else '?'} averiada"
             if ag.asignada_a not in (None, tr.id):
-                return rechazar(f"aguja {ag.nombre} ocupada por otra ruta")
+                return f"aguja {ag.nombre} ocupada por otra ruta"
 
         celdas_alt = []
         s = c1 + LONG_CANTON / 2
@@ -589,9 +602,9 @@ class Simulacion:
             celda_alt = (via_alt, canton_de(s_a_x(s, sentido)))
             c = self.cantones[celda_alt]
             if ocup.get(celda_alt):
-                return rechazar(f"{c.id} ocupado")
+                return f"{c.id} ocupado"
             if celda_alt in self.reservas or c.obstaculo_x is not None or c.fallo_cv:
-                return rechazar(f"{c.id} no disponible")
+                return f"{c.id} no disponible"
             celdas_alt.append(celda_alt)
             s += LONG_CANTON
 
@@ -602,7 +615,7 @@ class Simulacion:
             celda_inc = (tr.via_base, canton_de(x_inc))
             c = self.cantones[celda_inc]
             if ocup.get(celda_inc) or celda_inc in self.reservas:
-                return rechazar(f"cantón de reincorporación {c.id} ocupado")
+                return f"cantón de reincorporación {c.id} ocupado"
             celdas_alt.append(celda_inc)
 
         # Enclavamiento de aproximación: ningún otro tren puede estar ya comprometido
@@ -615,7 +628,7 @@ class Simulacion:
                 ent_o = entrada_canton_s(idx_c, o.sentido)
                 d = ent_o - o.s
                 if o.via_en(ent_o + 1) == via_c and -1 <= d < o.distancia_frenado() + 400:
-                    return rechazar(f"{o.id} aproximándose a {id_canton(via_c, idx_c)}")
+                    return f"{o.id} aproximándose a {id_canton(via_c, idx_c)}"
 
         # Ruta factible: reservar y mover agujas
         for ce in celdas_alt:
@@ -632,7 +645,44 @@ class Simulacion:
         self.bus.enviar(self.t, "CTC", tr.id, "RUTA ALT.",
                         f"Ruta por vía {via_alt} banalizada entre PK {xa / 1000:.0f} y PK {xb / 1000:.0f} "
                         f"({', '.join(id_canton(*ce) for ce in celdas_alt)}).", "accion")
-        return True
+        return None
+
+    # --------------------------------------------- orden manual de cambio de vía
+    def ordenar_cambio_via(self, tid: str) -> str:
+        """El operador del CTC pide pasar un tren a la vía contraria entre los dos próximos
+        escapes. El CTC la ejecuta en cuanto sea segura (reintenta cada 5 s)."""
+        tr = self.tren(tid)
+        if not tr.en_linea:
+            return f"{tid} está fuera del tramo; espera a que entre."
+        if tr.plan:
+            return f"{tid} ya circula por una ruta alternativa."
+        tr.orden_cambio = True
+        tr.prox_intento_ruta = 0.0
+        self.bus.enviar(self.t, "Operador", "CTC", "ORDEN MANUAL",
+                        f"Solicitado cambio de vía para {tid}.", "accion")
+        resultado = self._intentar_orden_cambio(tr)
+        return resultado
+
+    def _intentar_orden_cambio(self, tr: AgenteTren) -> str:
+        tr.prox_intento_ruta = self.t + 5.0
+        escapes_s = sorted(x_a_s(x, tr.sentido) for x in ESCAPES)
+        alcanzables = [e for e in escapes_s if e >= tr.s + tr.distancia_frenado() + 150]
+        if len(alcanzables) < 2:
+            tr.orden_cambio = False
+            self.bus.enviar(self.t, "CTC", tr.id, "ORDEN MANUAL",
+                            "Orden anulada: no quedan dos escapes por delante del tren.", "aviso")
+            return f"No quedan escapes por delante de {tr.id}: orden anulada."
+        c1, c2 = alcanzables[0], alcanzables[1]
+        razon = self._establecer_ruta(tr, c1, c2, self._mapa_ocupacion())
+        if razon is None:
+            tr.orden_cambio = False
+            return f"{tr.id}: ruta por la vía contraria establecida."
+        clave = f"manual{razon}"
+        if tr.ultimo_rechazo != clave:
+            tr.ultimo_rechazo = clave
+            self.bus.enviar(self.t, "CTC", tr.id, "ORDEN MANUAL",
+                            f"En espera: {razon}. Reintento automático.", "aviso")
+        return f"{tr.id}: orden en espera ({razon}). El CTC la ejecutará en cuanto sea segura."
 
     def _liberar_ruta(self, tr: AgenteTren, motivo: str):
         for ce in [k for k, v in self.reservas.items() if v == tr.id]:
